@@ -1,0 +1,72 @@
+# ==========================================
+# 1. Environment & Secrets (CRITICAL)
+# ==========================================
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+cli-config.yaml
+
+# ==========================================
+# 2. Python Bytecode & Virtual Environments
+# ==========================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+.venv/
+env/
+ENV/
+build/
+dist/
+*.egg-info/
+
+# ==========================================
+# 3. Testing, Caches & Coverage
+# ==========================================
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# ==========================================
+# 4. TTS Audio Dumps & Local Model Weights
+# ==========================================
+tts_samples/
+models/
+*.mp3
+*.wav
+*. pcm
+*.raw
+*.onnx
+*.bin
+*.pth
+*.pt
+*.safetensors
+*.gguf
+
+# ==========================================
+# 5. n8n Backups, Databases & Logs
+# ==========================================
+n8n_backup/
+.n8n/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.db
+*.log
+logs/
+
+# ==========================================
+# 6. Node / IDE / OS Junk
+# ==========================================
+node_modules/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+Desktop.ini

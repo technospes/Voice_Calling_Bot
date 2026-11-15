@@ -1,0 +1,375 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Voice Agent Sandbox</title>
+    <style>
+        body { font-family: sans-serif; display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; background: #1e1e1e; color: white; margin: 0; }
+        button { padding: 20px 40px; font-size: 20px; border-radius: 50px; border: none; background: #00d2ff; color: #000; cursor: pointer; user-select: none; touch-action: manipulation; }
+        button:active { background: #00a3cc; }
+        #status { margin-top: 20px; font-size: 18px; color: #aaa; text-align: center; }
+        #metrics { margin-top: 10px; font-size: 13px; color: #666; font-family: monospace; }
+    </style>
+</head>
+<body>
+    <h2>🌶️ Spice Villa Agent Tester</h2>
+    <button id="talkBtn">Hold to Talk</button>
+    <p id="status">Connecting to backend...</p>
+    <div id="metrics"></div>
+
+    <script>
+        const status = document.getElementById("status");
+        const talkBtn = document.getElementById("talkBtn");
+        const metrics = document.getElementById("metrics");
+
+        let ws = null;
+        let mediaRecorder = null;
+        let audioChunks = [];
+        const audioElement = new Audio();
+
+        // Feature detection for MSE audio/mpeg streaming support
+        const supportsMse = window.MediaSource && MediaSource.isTypeSupported('audio/mpeg');
+        let useTtsStream = supportsMse;
+
+        // Turn & Streaming State Variables
+        let currentTurn = 0;
+        let mediaSource = null;
+        let sourceBuffer = null;
+        let chunkQueue = [];
+        let isSourceOpen = false;
+        let streamEnded = false;
+        let currentObjectUrl = null;
+        
+        // Fatal streaming session state flag
+        let streamingFailed = false;
+
+        // Telemetry Timers
+        let tRecordStart = 0;
+        let tUploadEnd = 0;
+        let tFirstChunk = 0;
+        let hasTriggeredPlay = false;
+        let isStreamingTurnActive = false;
+
+        function connectWebSocket() {
+            streamingFailed = false;
+            ws = new WebSocket("ws://localhost:8000/voice/stream/local_test");
+
+            ws.onopen = () => {
+                status.innerText = "✅ Connected. Hold the button to speak.";
+                if (useTtsStream) {
+                    // Send capability hello handshake matching app/voice/protocol.py
+                    ws.send(JSON.stringify({ event: "hello", caps: ["tts_stream"] }));
+                    console.log("Sent tts_stream hello handshake to backend.");
+                } else {
+                    console.log("Connected in legacy audio blob mode.");
+                }
+            };
+
+            ws.onerror = () => {
+                status.innerText = "❌ Connection failed. Is FastAPI running?";
+            };
+
+            ws.onclose = () => {
+                if (!streamingFailed) {
+                    status.innerText = "🔌 Connection closed.";
+                }
+            };
+
+            ws.onmessage = handleWebSocketMessage;
+        }
+
+        async function handleWebSocketMessage(event) {
+            // If a fatal streaming error occurred, stop processing all subsequent messages
+            if (streamingFailed) return;
+
+            // 1. Handle JSON Control Messages (tts_start, tts_end)
+            if (typeof event.data === 'string') {
+                let msg;
+                try {
+                    msg = JSON.parse(event.data);
+                } catch (e) {
+                    console.error("Failed to parse control message:", event.data);
+                    return;
+                }
+
+                if (msg.event === "tts_start") {
+                    cleanupMediaSource();
+                    currentTurn = msg.turn || (currentTurn + 1);
+                    streamEnded = false;
+                    hasTriggeredPlay = false;
+                    tFirstChunk = 0;
+                    isStreamingTurnActive = useTtsStream;
+                    status.innerText = "🔊 AI is speaking (streaming)...";
+
+                    if (useTtsStream) {
+                        initMediaSource();
+                    }
+                } else if (msg.event === "tts_end") {
+                    streamEnded = true;
+                    checkAndFinalizeStream();
+                }
+                return;
+            }
+
+            // 2. Handle Binary Audio Chunks or Legacy Blobs
+            const arrayBuffer = await event.data.arrayBuffer();
+            if (arrayBuffer.byteLength === 0) return;
+
+            if (tFirstChunk === 0 && tUploadEnd > 0) {
+                tFirstChunk = performance.now();
+                const firstChunkMs = Math.round(tFirstChunk - tUploadEnd);
+                console.log(`⏱️ First binary chunk received: ${firstChunkMs}ms`);
+            }
+
+            if (useTtsStream && isStreamingTurnActive && mediaSource) {
+                enqueueOrAppendChunk(arrayBuffer);
+            } else if (!isStreamingTurnActive) {
+                playLegacyBlob(arrayBuffer);
+            }
+        }
+
+        // --- MSE & SourceBuffer Management with Fatal Error Handling ---
+        function cleanupMediaSource() {
+            chunkQueue = [];
+            isSourceOpen = false;
+            streamEnded = false;
+            isStreamingTurnActive = false;
+
+            if (!audioElement.paused) {
+                audioElement.pause();
+            }
+            audioElement.currentTime = 0;
+            audioElement.onplaying = null;
+            audioElement.onended = null;
+            audioElement.onerror = null;
+
+            if (sourceBuffer) {
+                try {
+                    if (sourceBuffer.updating) sourceBuffer.abort();
+                    sourceBuffer.removeEventListener('updateend', onSourceBufferUpdateEnd);
+                } catch (e) {}
+                sourceBuffer = null;
+            }
+
+            if (mediaSource) {
+                if (mediaSource.readyState === 'open') {
+                    try { mediaSource.endOfStream(); } catch (e) {}
+                }
+                mediaSource = null;
+            }
+
+            if (currentObjectUrl) {
+                URL.revokeObjectURL(currentObjectUrl);
+                currentObjectUrl = null;
+            }
+        }
+
+        function handleFatalStreamError(errorMessage) {
+            console.error(errorMessage);
+            streamingFailed = true;
+            isStreamingTurnActive = false;
+            status.innerText = `❌ ${errorMessage} Please restart the test manually.`;
+            cleanupMediaSource();
+
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.close();
+            }
+        }
+
+        function initMediaSource() {
+            try {
+                mediaSource = new MediaSource();
+            } catch (e) {
+                handleFatalStreamError("MediaSource initialization failed.");
+                return;
+            }
+
+            currentObjectUrl = URL.createObjectURL(mediaSource);
+            audioElement.src = currentObjectUrl;
+
+            audioElement.onplaying = () => {
+                status.innerText = "🔊 AI is speaking...";
+                if (tUploadEnd > 0 && !hasTriggeredPlay) {
+                    hasTriggeredPlay = true;
+                    const playbackStartMs = Math.round(performance.now() - tUploadEnd);
+                    const uploadMs = tUploadEnd > tRecordStart ? Math.round(tUploadEnd - tRecordStart) : 0;
+                    metrics.innerText = `Time-to-Sound: ${playbackStartMs}ms`;
+
+                    ws.send(JSON.stringify({
+                        event: "client_timing",
+                        turn: currentTurn,
+                        upload_ms: uploadMs,
+                        playback_start_ms: playbackStartMs
+                    }));
+                }
+            };
+
+            audioElement.onended = () => {
+                status.innerText = "✅ Ready. Hold the button to speak.";
+            };
+
+            audioElement.onerror = (e) => {
+                console.error("Audio element error during streaming:", e);
+                handleFatalStreamError("Audio playback error encountered.");
+            };
+
+            mediaSource.addEventListener('sourceopen', () => {
+                if (!mediaSource || mediaSource.readyState !== 'open') return;
+                isSourceOpen = true;
+                try {
+                    sourceBuffer = mediaSource.addSourceBuffer('audio/mpeg');
+                    sourceBuffer.mode = 'segments';
+                    sourceBuffer.addEventListener('updateend', onSourceBufferUpdateEnd);
+                    sourceBuffer.addEventListener('error', (e) => {
+                        console.error("SourceBuffer error event:", e);
+                        handleFatalStreamError("SourceBuffer encountered an error.");
+                    });
+                    
+                    drainQueue();
+                } catch (e) {
+                    handleFatalStreamError("Failed to add audio/mpeg SourceBuffer.");
+                }
+            }, { once: true });
+        }
+
+        function enqueueOrAppendChunk(arrayBuffer) {
+            chunkQueue.push(arrayBuffer);
+            drainQueue();
+        }
+
+        function drainQueue() {
+            if (streamingFailed || !isSourceOpen || !sourceBuffer || sourceBuffer.updating || chunkQueue.length === 0) {
+                checkAndFinalizeStream();
+                return;
+            }
+
+            const chunk = chunkQueue.shift();
+            try {
+                sourceBuffer.appendBuffer(chunk);
+            } catch (e) {
+                console.error("Error appending chunk to SourceBuffer:", e);
+                handleFatalStreamError("Playback buffer append failed.");
+            }
+        }
+
+        function onSourceBufferUpdateEnd() {
+            if (streamingFailed) return;
+            if (audioElement.paused && sourceBuffer && !sourceBuffer.updating) {
+                audioElement.play().catch(err => {
+                    console.warn("Autoplay restriction prevented auto-play:", err);
+                });
+            }
+            drainQueue();
+        }
+
+        function checkAndFinalizeStream() {
+            if (streamingFailed) return;
+            if (streamEnded && isSourceOpen && sourceBuffer && !sourceBuffer.updating && chunkQueue.length === 0) {
+                if (mediaSource && mediaSource.readyState === 'open') {
+                    try {
+                        mediaSource.endOfStream();
+                    } catch (e) {
+                        console.warn("Could not call endOfStream safely:", e);
+                    }
+                }
+            }
+        }
+
+        // --- Legacy Full-Audio Fallback Mode (Used only if unsupported before hello handshake) ---
+        function playLegacyBlob(arrayBuffer) {
+            status.innerText = "🔊 AI is speaking...";
+            const audioBlob = new Blob([arrayBuffer], { type: 'audio/mp3' });
+            const blobUrl = URL.createObjectURL(audioBlob);
+            audioElement.src = blobUrl;
+
+            audioElement.onplaying = () => {
+                if (tUploadEnd > 0 && !hasTriggeredPlay) {
+                    hasTriggeredPlay = true;
+                    const latency = Math.round(performance.now() - tUploadEnd);
+                    const uploadMs = tUploadEnd > tRecordStart ? Math.round(tUploadEnd - tRecordStart) : 0;
+                    metrics.innerText = `Legacy Playback Latency: ${latency}ms`;
+                    
+                    ws.send(JSON.stringify({
+                        event: "client_timing",
+                        turn: currentTurn,
+                        upload_ms: uploadMs,
+                        playback_start_ms: latency
+                    }));
+                }
+            };
+
+            audioElement.onended = () => {
+                status.innerText = "✅ Ready. Hold the button to speak.";
+                URL.revokeObjectURL(blobUrl);
+            };
+
+            audioElement.play().catch(err => {
+                console.warn("Legacy audio play blocked by browser autoplay policy:", err);
+            });
+        }
+
+        // --- Pointer Events for Touch & Mouse Compatibility ---
+        navigator.mediaDevices.getUserMedia({ audio: true }).then(stream => {
+            talkBtn.onpointerdown = (e) => {
+                e.preventDefault();
+                if (streamingFailed) {
+                    status.innerText = "❌ Streaming failed. Please restart the test manually.";
+                    return;
+                }
+                audioChunks = [];
+                tRecordStart = performance.now();
+                try {
+                    mediaRecorder = new MediaRecorder(stream);
+                    mediaRecorder.ondataavailable = ev => {
+                        if (ev.data && ev.data.size > 0) {
+                            audioChunks.push(ev.data);
+                        }
+                    };
+                    mediaRecorder.onstop = () => {
+                        tUploadEnd = performance.now();
+                        const blob = new Blob(audioChunks, { type: 'audio/webm' });
+                        tFirstChunk = 0;
+                        hasTriggeredPlay = false;
+                        status.innerText = "🧠 Thinking...";
+                        metrics.innerText = "";
+                        if (ws && ws.readyState === WebSocket.OPEN) {
+                            ws.send(blob);
+                        } else {
+                            status.innerText = "❌ Not connected to server.";
+                        }
+                    };
+                    mediaRecorder.start();
+                    status.innerText = "🎙️ Listening...";
+                } catch (err) {
+                    console.error("Failed to start MediaRecorder:", err);
+                    status.innerText = "❌ Recording failed.";
+                }
+            };
+
+            talkBtn.onpointerup = () => {
+                if (mediaRecorder && mediaRecorder.state === "recording") {
+                    mediaRecorder.stop();
+                }
+            };
+
+            talkBtn.onpointercancel = () => {
+                if (mediaRecorder && mediaRecorder.state === "recording") {
+                    mediaRecorder.stop();
+                }
+            };
+
+            talkBtn.onpointerleave = () => {
+                if (mediaRecorder && mediaRecorder.state === "recording") {
+                    mediaRecorder.stop();
+                }
+            };
+        }).catch(err => {
+            console.error("Microphone access denied or unavailable:", err);
+            status.innerText = "❌ Microphone access denied.";
+        });
+
+        // Initial connection
+        connectWebSocket();
+    </script>
+</body>
+</html>
